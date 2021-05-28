@@ -7,7 +7,7 @@
 ;; Version: 0.7.1
 ;; URL: https://github.com/jschaf/esup
 ;; Keywords: convenience, processes
-;; Package-Requires: ((cl-lib "0.5") (s "1.2") (emacs "25.1"))
+;; Package-Requires: ((cl-lib "0.5") (emacs "25.1"))
 
 ;; This file is NOT part of GNU Emacs.
 
@@ -64,7 +64,6 @@
 
 ;;; Requirements
 
-(require 'eieio)
 (require 'esup-child)
 
 (eval-when-compile
@@ -169,35 +168,32 @@ Includes execution time, gc time and number of gc pauses."
 (defun esup-total-exec-time (results)
   "Calculate the total execution time of RESULTS."
   (cl-loop for result in results
-           sum (slot-value result 'exec-time) into total-exec-time
-           finally return total-exec-time))
+           sum (esup-result-exec-time result)))
 
 (defun esup-total-gc-number (results)
   "Calculate the total number of GC pauses of RESULTS."
   (cl-loop for result in results
-           sum (slot-value result 'gc-number) into total-gc-number
-           finally return total-gc-number))
+           sum (esup-result-gc-number result)))
 
 (defun esup-total-gc-time (results)
   "Calculate the total time spent in GC of RESULTS."
   (cl-loop for result in results
-           sum (slot-value result 'gc-time) into total-gc-time
-           finally return total-gc-time))
+           sum (esup-result-gc-time result)))
 
 (defun esup-drop-insignificant-times (results)
   "Remove inconsequential entries and sort RESULTS."
-  (cl-delete-if (lambda (a) (< a esup-insignificant-time))
-                results
-                :key #'(lambda (obj) (slot-value obj 'exec-time)))
-  (cl-sort results '> :key #'(lambda (obj) (slot-value obj 'exec-time))))
+  (cl-sort (cl-delete-if (lambda (a) (< a esup-insignificant-time))
+                         results
+                         :key #'esup-result-exec-time)
+           #'> :key #'esup-result-exec-time))
 
 (defun esup-update-percentages (results)
   "Add the percentage of exec-time to each item in RESULTS."
-  (cl-loop for result in results
-           with total-time = (esup-total-exec-time results)
-           do
-           (oset result :percentage (* 100 (/ (slot-value result 'exec-time)
-                                              total-time)))))
+  (let ((total-time (esup-total-exec-time results)))
+    (dolist (result results)
+      (setf (esup-result-percentage result)
+            (* 100 (/ (esup-result-exec-time result)
+                      total-time))))))
 
 
 ;;; Controller - the entry points.
@@ -214,7 +210,7 @@ Includes execution time, gc time and number of gc pauses."
       (message "Not at a file."))))
 
 (define-derived-mode esup-mode
-    special-mode "esup"
+  special-mode "esup"
   (font-lock-mode 1))
 
 (define-key esup-mode-map (kbd "<return>") 'esup-visit-item)
@@ -382,12 +378,8 @@ Provides a useful default for SERVER, CONNECTION and MESSAGE."
   (esup-server-log "logged: server %s, connection %s, message %s"
                    server connection message))
 
-(defvar esup-last-result-start-point 1
-  "The end point of the last read result from `esup-incoming-results-buffer'.")
-
 (defun esup-reset ()
   "Reset all variables and buffers for another run of `esup'."
-  (setq esup-last-result-start-point 1)
   (with-current-buffer (get-buffer-create esup-server-log-buffer)
     (erase-buffer))
   (with-current-buffer (get-buffer-create esup-incoming-results-buffer)
@@ -416,25 +408,18 @@ ARGS is a list of extra command line arguments to pass to Emacs."
   (setq esup-server-port (process-contact esup-server-process :service))
   (message "esup process started on port %s" esup-server-port)
 
-  (let ((process-args `("*esup-child*"
-                        "*esup-child*"
-                        ,esup-emacs-path
-                        ,@args
-                        "-q"
-                        "-L" ,esup-load-path
-                        "-l" "esup-child"
-                        ,(format "--eval=(esup-child-run \"%s\" \"%s\" %d)"
-                                 init-file
-                                 esup-server-port
-                                 esup-depth))))
-
-    ;; The option -q is set by itself because this `start-process' errors if we
-    ;; pass either an empty string or nil as an argument.
-    (when esup-run-as-batch-p
-      (setq process-args (append process-args '("--batch"))))
-    (setq esup-child-process (apply #'start-process process-args)))
-
-  (set-process-sentinel esup-child-process 'esup-child-process-sentinel))
+  (set-process-sentinel
+   (apply #'start-process "*esup-child*" "*esup-child*" esup-emacs-path
+          (append args
+                  ;; The option -q is set by itself because this `start-process' errors if we
+                  ;; pass either an empty string or nil as an argument.
+                  `("-q" "-L" ,esup-load-path "-l" "esup-child"
+                    ,(format "--eval=(esup-child-run %S %S %d)"
+                             init-file
+                             esup-server-port
+                             esup-depth))
+                  (and esup-run-as-batch-p '("--batch"))))
+   #'esup-child-process-sentinel))
 
 (defun esup-follow-link (pos)
   "Follow the link that was clicked at point POS."
@@ -447,14 +432,9 @@ ARGS is a list of extra command line arguments to pass to Emacs."
 
 ;;; Utilities.
 
-(defsubst esup-propertize-string (str &rest properties)
-  "Replace all properties of STR with PROPERTIES."
-  (set-text-properties 0 (length str) properties str)
-  str)
-
 (defsubst esup-fontify-string (str face)
   "Modify STR's font-lock-face property to FACE and return STR."
-  (esup-propertize-string str 'font-lock-face face))
+  (propertize str 'font-lock-face face))
 
 
 ;;; View - rendering functions.
@@ -462,33 +442,24 @@ ARGS is a list of extra command line arguments to pass to Emacs."
 (defvar esup-display-buffer "*esup*"
   "The buffer in which to display benchmark results.")
 
-(defun esup-buffer ()
-  "Initialize and return the *esup* buffer."
-  (let ((buf (get-buffer esup-display-buffer)))
-    (if buf
-        buf
-      (setq buf (generate-new-buffer esup-display-buffer))
-      (with-current-buffer buf
-        (esup-mode)))
-    buf))
-
 (defun esup-display-results ()
   "Display the results of the benchmarking."
   (interactive)
   (let* ((all-results (esup-fontify-results
                        (esup-read-results)))
          (results (esup-drop-insignificant-times all-results))
-         (result-break (esup-propertize-string "\n" 'result-break t))
+         (result-break (propertize "\n" 'result-break t))
          ;; Needed since the buffer is in `view-mode'.
          (inhibit-read-only t))
-    (with-current-buffer (esup-buffer)
+    (with-current-buffer (get-buffer-create esup-display-buffer)
       (erase-buffer)
+      (esup-mode)
       (esup-update-percentages results)
       (when esup-errors
         (insert (esup-render-errors esup-errors) result-break))
       (insert (esup-render-summary results) result-break)
-      (cl-loop for result in results
-               do (insert (render result) result-break))
+      (dolist (result results)
+        (insert (esup-render result) result-break))
       ;; We want the user to be at the top because it's disorienting
       ;; to start at the bottom.
       (goto-char (point-min))
@@ -502,9 +473,8 @@ ARGS is a list of extra command line arguments to pass to Emacs."
        (esup-fontify-string
         "ERROR: the child emacs had the following errors:\n"
         'esup-error-face)
-       (mapconcat 'identity
-                  (cl-loop for error-string in errors
-                           collect (format "  %s" error-string))
+       (mapconcat (apply-partially #'format "  %s")
+                  errors
                   "\n")
        "\n\n"
        (esup-fontify-string "Results will be incomplete due to errors.\n\n"
@@ -528,73 +498,55 @@ ARGS is a list of extra command line arguments to pass to Emacs."
                           'esup-timing-information)
      "\n")))
 
-(cl-defmethod render ((obj esup-result))
+(defun esup-render (obj)
   "Render fields with OBJ and return the string."
-  (with-slots (file expression-string start-point end-point line-number
-                    exec-time percentage)
-      obj
-    (let* ((short-file (file-name-nondirectory file)))
-      ;; TODO: make mouse clicking work on goto file
-      (esup-propertize-string
-       short-file
-       'font-lock-face 'esup-file
-       'mouse-face 'highlight
-       'full-file file
-       'follow-link 'esup-open-link
-       'start-point start-point
-       'keymap 'esup-open-link)
+  (let* ((file (esup-result-file obj))
+         (short-file (file-name-nondirectory file))
+         (expression-string (esup-result-expression-string obj))
+         (start-point (esup-result-start-point obj))
+         (line-number (esup-result-line-number obj))
+         (exec-time (esup-result-exec-time obj))
+         (percentage (esup-result-percentage obj)))
+    (propertize
+     short-file
+     'font-lock-face 'esup-file
+     'mouse-face 'highlight
+     'full-file file
+     'follow-link 'esup-open-link
+     'start-point start-point
+     'keymap 'esup-open-link)
 
-      (concat
-       short-file
-       (esup-fontify-string (format ":%d  " line-number)
-                            'esup-line-number)
-       (esup-fontify-string (format "%.3fsec" exec-time)
-                            'esup-timing-information)
-       "   "
-       (esup-fontify-string (format "%d%%" percentage)
-                            'esup-timing-information)
-       "\n"
-       expression-string
-       "\n"))))
+    (concat
+     short-file
+     (esup-fontify-string (format ":%d  " line-number)
+                          'esup-line-number)
+     (esup-fontify-string (format "%.3fsec" exec-time)
+                          'esup-timing-information)
+     "   "
+     (esup-fontify-string (format "%d%%" percentage)
+                          'esup-timing-information)
+     "\n"
+     expression-string
+     "\n")))
 
 (defun esup-fontify-results (results)
   "Add Emacs-Lisp font-lock to each expression in RESULTS."
   (with-temp-buffer
     (emacs-lisp-mode)
-    (cl-loop for result in results
-             do
-             (erase-buffer)
-             (insert (slot-value result 'expression-string))
-	     (font-lock-ensure)
-	     (setf (slot-value result 'expression-string) (buffer-string)))
+    (dolist (result results)
+      (erase-buffer)
+      (insert (esup-result-expression-string result))
+      (font-lock-ensure)
+      (setf (esup-result-expression-string result) (buffer-string)))
     results))
-
-(defun esup-read-result (start-point)
-  "Return one `esup-result' object from the current buffer.
-Begins reading at START-POINT.
-Returns either a class `esup-result' or nil."
-  (goto-char start-point)
-  (eval (read (current-buffer))))
-
-(defun esup-next-separator-end-point ()
-  "Return the end point of the next `esup-child-result-separator'.
-Returns either an point or nil if `esup-child-result-separator' isn't bounded in
-current lexical context."
-  (when (boundp 'esup-child-result-separator)
-    (save-excursion (search-forward esup-child-result-separator
-                                    (point-max) 'noerror))))
 
 (defun esup-read-results ()
   "Read all `esup-result' objects from `esup-incoming-results-buffer'."
-  (let (results sep-end-point)
+  (let (results)
     (with-current-buffer (get-buffer esup-incoming-results-buffer)
-      (goto-char esup-last-result-start-point)
-      (message "at %s" esup-last-result-start-point)
-      (unless (eobp)
-        (while (setq sep-end-point (esup-next-separator-end-point))
-          (setq results (cons (car (esup-read-result (point))) results))
-          (setq esup-last-result-start-point sep-end-point)
-          (goto-char esup-last-result-start-point))))
+      (goto-char (point-min))
+      (while (not (eobp))
+        (push (read (current-buffer)) results)))
     (nreverse results)))
 
 
